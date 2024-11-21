@@ -37,8 +37,13 @@ class PNP(nn.Module):
         # Create SD models
         print('Loading SD model')
 
-        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=torch.float16).to("cuda")
-        pipe.enable_xformers_memory_efficient_attention()
+        if self.device == 'mps':
+            dtype = torch.float32
+        else:
+            dtype = torch.float16
+
+        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=torch.float32).to(self.device) #.to("cuda")
+        # pipe.enable_xformers_memory_efficient_attention()
 
         self.vae = pipe.vae
         self.tokenizer = pipe.tokenizer
@@ -46,6 +51,7 @@ class PNP(nn.Module):
         self.unet = pipe.unet
 
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
+        print(self.device)
         self.scheduler.set_timesteps(config["n_timesteps"], device=self.device)
         print('SD model loaded')
 
@@ -75,14 +81,27 @@ class PNP(nn.Module):
         return text_embeddings
 
     @torch.no_grad()
-    def decode_latent(self, latent):
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
-            latent = 1 / 0.18215 * latent
-            img = self.vae.decode(latent).sample
-            img = (img / 2 + 0.5).clamp(0, 1)
-        return img
+    def decode_latent(self, latents):
+        if self.device != 'mps':
+            # Use autocast only for 'cuda' or 'cpu'
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                latents = 1 / 0.18215 * latents
+                imgs = self.vae.decode(latents).sample
+                imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        else:
+            # Use float32 without autocast for 'mps'
+            latents = 1 / 0.18215 * latents
+            imgs = self.vae.decode(latents).sample
+            imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        return imgs
+    # def decode_latent(self, latent):
+    #     with torch.autocast(device_type=self.device.type, dtype=torch.float32):
+    #         latent = 1 / 0.18215 * latent
+    #         img = self.vae.decode(latent).sample
+    #         img = (img / 2 + 0.5).clamp(0, 1)
+    #     return img
 
-    @torch.autocast(device_type='cuda', dtype=torch.float32)
+    # @torch.autocast(device_type=self.device.type, dtype=torch.float32)
     def get_data(self):
         # load image
         image = Image.open(self.config["image_path"]).convert('RGB') 
@@ -179,13 +198,27 @@ class PNP(nn.Module):
         edited_img = self.sample_loop(self.eps)
 
     def sample_loop(self, x):
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
-            for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Sampling")):
-                x = self.denoise_step(x, t)
-            decoded_latent = self.decode_latent(x)
-            T.ToPILImage()(decoded_latent[0]).save(f'{self.config["output_path"]}/output-{self.config["prompt"]}.png')
-                
+        if self.device != 'mps':
+            # Use autocast only for 'cuda' or 'cpu'
+            with torch.autocast(device_type=self.device, dtype=torch.float16):
+                for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Sampling")):
+                    x = self.denoise_step(x, t)
+                decoded_latent = self.decode_latent(x)
+                T.ToPILImage()(decoded_latent[0]).save(f'{self.config["output_path"]}/output-{self.config["prompt"]}.png') 
+        else:
+            with torch.no_grad():
+                for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Sampling")):
+                    x = self.denoise_step(x, t)
+                decoded_latent = self.decode_latent(x)
+                T.ToPILImage()(decoded_latent[0]).save(f'{self.config["output_path"]}/output-{self.config["prompt"]}.png') 
         return decoded_latent
+        # with torch.autocast(device_type='cuda', dtype=torch.float32):
+        #     for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Sampling")):
+        #         x = self.denoise_step(x, t)
+        #     decoded_latent = self.decode_latent(x)
+        #     T.ToPILImage()(decoded_latent[0]).save(f'{self.config["output_path"]}/output-{self.config["prompt"]}.png')
+                
+        # return decoded_latent
     
     def init_pnp_lora(self, unet_lora, conv_injection_t, qk_injection_t):
         self.qk_injection_timesteps = self.scheduler.timesteps[:qk_injection_t] if qk_injection_t >= 0 else []
@@ -201,7 +234,7 @@ class PNP(nn.Module):
         for lora_name in self.lora_name_list:
             unet_lora_temp = copy.deepcopy(self.unet)
             load_lora_paths = './lora_models/' + lora_name.strip() + '.ckpt'
-            lora = torch.load(load_lora_paths, map_location="cpu")
+            lora = torch.load(load_lora_paths, map_location="mps")
             unet_lora_temp.load_attn_procs(lora)
             self.init_pnp_lora(unet_lora_temp,30,25)
             self.lora_list.append(unet_lora_temp)

@@ -138,7 +138,7 @@ def train_lora(image, prompt, save_lora_dir, model_path=None, tokenizer=None, te
         )
 
     # set device and dtype
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("mps")#("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -170,7 +170,8 @@ def train_lora(image, prompt, save_lora_dir, model_path=None, tokenizer=None, te
                 LoRAAttnProcessor2_0 if hasattr(F, "scaled_dot_product_attention") else LoRAAttnProcessor
             )
         unet_lora_attn_procs[name] = lora_attn_processor_class(
-            hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, rank=lora_rank
+            hidden_size=hidden_size, 
+            cross_attention_dim=cross_attention_dim, rank=lora_rank
         )
     unet.set_attn_processor(unet_lora_attn_procs)
     unet_lora_layers = AttnProcsLayers(unet.attn_processors)

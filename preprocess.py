@@ -15,7 +15,7 @@ from pnp_utils_combine import *
 import torchvision.transforms as T
 
 
-def get_timesteps(scheduler, num_inference_steps, strength, device):
+def get_timesteps(scheduler, num_inference_steps, strength, device_type):
     # get the original timestep using init_timestep
     init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
 
@@ -48,34 +48,47 @@ class Preprocess(nn.Module):
             self.use_depth = True
         else:
             raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
+        
+        # Determine the appropriate data type
+        if self.device.type == 'mps':
+            dtype = torch.float32
+        else:
+            dtype = torch.float16
 
         # Create model
         self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae", revision="fp16",
-                                                 torch_dtype=torch.float16).to(self.device)
+                                                 torch_dtype=torch.float32).to(self.device)
         self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder", revision="fp16",
-                                                          torch_dtype=torch.float16).to(self.device)
+                                                          torch_dtype=torch.float32).to(self.device)
         self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet", revision="fp16",
-                                                         torch_dtype=torch.float16).to(self.device)
+                                                         torch_dtype=torch.float32).to(self.device)
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
         print(f'[INFO] loaded stable diffusion!')
 
         self.inversion_func = self.ddim_inversion
 
     @torch.no_grad()
-    def get_text_embeds(self, prompt, negative_prompt, device="cuda"):
+    def get_text_embeds(self, prompt, negative_prompt, device_type):
         text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
                                     truncation=True, return_tensors='pt')
-        text_embeddings = self.text_encoder(text_input.input_ids.to(device))[0]
+        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
         uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
                                       return_tensors='pt')
-        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(device))[0]
+        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         return text_embeddings
 
     @torch.no_grad()
     def decode_latents(self, latents):
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
+        if self.device.type != 'mps':
+            # Use autocast only for 'cuda' or 'cpu'
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                latents = 1 / 0.18215 * latents
+                imgs = self.vae.decode(latents).sample
+                imgs = (imgs / 2 + 0.5).clamp(0, 1)
+        else:
+            # Use float32 without autocast for 'mps'
             latents = 1 / 0.18215 * latents
             imgs = self.vae.decode(latents).sample
             imgs = (imgs / 2 + 0.5).clamp(0, 1)
@@ -88,45 +101,98 @@ class Preprocess(nn.Module):
 
     @torch.no_grad()
     def encode_imgs(self, imgs):
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
+        if self.device.type != 'mps':
+            # Use autocast only for 'cuda' or 'cpu'
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                imgs = 2 * imgs - 1
+                posterior = self.vae.encode(imgs).latent_dist
+                latents = posterior.mean * 0.18215
+        else:
+            # Use float32 without autocast for 'mps'
             imgs = 2 * imgs - 1
             posterior = self.vae.encode(imgs).latent_dist
             latents = posterior.mean * 0.18215
         return latents
 
     @torch.no_grad()
-    def ddim_inversion(self, cond, latent, save_path, save_latents=True,
-                                timesteps_to_save=None):
+    def ddim_inversion(self, cond, latent, save_path, save_latents=True, timesteps_to_save=None):
         timesteps = reversed(self.scheduler.timesteps)
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
-            for i, t in enumerate(tqdm(timesteps)):
-                cond_batch = cond.repeat(latent.shape[0], 1, 1)
+        if self.device.type != 'mps':
+            # Use autocast only for 'cuda' or 'cpu'
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                for i, t in enumerate(tqdm(timesteps)):
+                    cond_batch = cond.repeat(latent.shape[0], 1, 1)
 
-                alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                alpha_prod_t_prev = (
-                    self.scheduler.alphas_cumprod[timesteps[i - 1]]
-                    if i > 0 else self.scheduler.final_alpha_cumprod
-                )
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    alpha_prod_t_prev = (
+                        self.scheduler.alphas_cumprod[timesteps[i - 1]]
+                        if i > 0 else self.scheduler.final_alpha_cumprod
+                    )
 
-                mu = alpha_prod_t ** 0.5
-                mu_prev = alpha_prod_t_prev ** 0.5
-                sigma = (1 - alpha_prod_t) ** 0.5
-                sigma_prev = (1 - alpha_prod_t_prev) ** 0.5
+                    mu = alpha_prod_t ** 0.5
+                    mu_prev = alpha_prod_t_prev ** 0.5
+                    sigma = (1 - alpha_prod_t) ** 0.5
+                    sigma_prev = (1 - alpha_prod_t_prev) ** 0.5
 
-                eps = self.unet(latent, t, encoder_hidden_states=cond_batch).sample
+                    eps = self.unet(latent, t, encoder_hidden_states=cond_batch).sample
 
-                pred_x0 = (latent - sigma_prev * eps) / mu_prev
-                latent = mu * pred_x0 + sigma * eps
-                if save_latents:
-                    torch.save(latent, os.path.join(save_path, f'noisy_latents_{t}.pt'))
+                    pred_x0 = (latent - sigma_prev * eps) / mu_prev
+                    latent = mu * pred_x0 + sigma * eps
+                    if save_latents:
+                        torch.save(latent, os.path.join(save_path, f'noisy_latents_{t}.pt'))
+        else:
+            # Use float32 without autocast for 'mps'
+            with torch.no_grad():
+                for i, t in enumerate(tqdm(timesteps)):
+                    cond_batch = cond.repeat(latent.shape[0], 1, 1)
+
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    alpha_prod_t_prev = (
+                        self.scheduler.alphas_cumprod[timesteps[i - 1]]
+                        if i > 0 else self.scheduler.final_alpha_cumprod
+                    )
+
+                    mu = alpha_prod_t ** 0.5
+                    mu_prev = alpha_prod_t_prev ** 0.5
+                    sigma = (1 - alpha_prod_t) ** 0.5
+                    sigma_prev = (1 - alpha_prod_t_prev) ** 0.5
+
+                    eps = self.unet(latent, t, encoder_hidden_states=cond_batch).sample
+
+                    pred_x0 = (latent - sigma_prev * eps) / mu_prev
+                    latent = mu * pred_x0 + sigma * eps
+                    if save_latents:
+                        torch.save(latent, os.path.join(save_path, f'noisy_latents_{t}.pt'))
         torch.save(latent, os.path.join(save_path, f'noisy_latents_{t}.pt'))
         return latent
 
     @torch.no_grad()
     def ddim_sample(self, x, cond, save_path, save_latents=False, timesteps_to_save=None):
         timesteps = self.scheduler.timesteps
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
-            for i, t in enumerate(tqdm(timesteps)):
+        if self.device.type != 'mps':
+            # Use autocast only for 'cuda' or 'cpu'
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                for i, t in enumerate(tqdm(timesteps)):
+                    cond_batch = cond.repeat(x.shape[0], 1, 1)
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    alpha_prod_t_prev = (
+                        self.scheduler.alphas_cumprod[timesteps[i + 1]]
+                        if i < len(timesteps) - 1
+                        else self.scheduler.final_alpha_cumprod
+                    )
+                    mu = alpha_prod_t ** 0.5
+                    sigma = (1 - alpha_prod_t) ** 0.5
+                    mu_prev = alpha_prod_t_prev ** 0.5
+                    sigma_prev = (1 - alpha_prod_t_prev) ** 0.5
+
+                    eps = self.unet(x, t, encoder_hidden_states=cond_batch).sample
+
+                    pred_x0 = (x - sigma * eps) / mu
+                    x = mu_prev * pred_x0 + sigma_prev * eps
+        else:
+            # Use float32 without autocast for 'mps'
+            with torch.no_grad():
+                for i, t in enumerate(tqdm(timesteps)):
                     cond_batch = cond.repeat(x.shape[0], 1, 1)
                     alpha_prod_t = self.scheduler.alphas_cumprod[t]
                     alpha_prod_t_prev = (
@@ -144,8 +210,8 @@ class Preprocess(nn.Module):
                     pred_x0 = (x - sigma * eps) / mu
                     x = mu_prev * pred_x0 + sigma_prev * eps
 
-            if save_latents:
-                torch.save(x, os.path.join(save_path, f'noisy_latents_{t}.pt'))
+        if save_latents:
+            torch.save(x, os.path.join(save_path, f'noisy_latents_{t}.pt'))
         return x
 
     @torch.no_grad()
@@ -153,7 +219,9 @@ class Preprocess(nn.Module):
                         inversion_prompt='', extract_reverse=False):
         self.scheduler.set_timesteps(num_steps)
 
-        cond = self.get_text_embeds(inversion_prompt, "")[1].unsqueeze(0)
+        # cond = self.get_text_embeds(inversion_prompt, "")[1].unsqueeze(0)
+        cond = self.get_text_embeds(inversion_prompt, "", device_type=self.device.type)[1].unsqueeze(0)
+        
         image = self.load_img(data_path)
         latent = self.encode_imgs(image)
 
@@ -181,7 +249,7 @@ def run(opt):
     toy_scheduler.set_timesteps(opt.save_steps)
     timesteps_to_save, num_inference_steps = get_timesteps(toy_scheduler, num_inference_steps=opt.save_steps,
                                                            strength=1.0,
-                                                           device=device)
+                                                           device_type=opt.device.type)
 
     seed_everything(opt.seed)
 
@@ -189,7 +257,7 @@ def run(opt):
     save_path = os.path.join(opt.save_dir + extraction_path_prefix, os.path.splitext(os.path.basename(opt.data_path))[0])
     os.makedirs(save_path, exist_ok=True)
 
-    model = Preprocess(device, sd_version=opt.sd_version, hf_key=None)
+    model = Preprocess(opt.device, sd_version=opt.sd_version, hf_key=None)
 
     recon_image = model.extract_latents(data_path=opt.data_path,
                                          num_steps=opt.steps,
@@ -202,7 +270,18 @@ def run(opt):
 
 
 if __name__ == "__main__":
-    device = 'cuda'
+    # device = 'cuda'
+
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("[INFO] Using MPS device for computation.")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("[INFO] Using CUDA device for computation.")
+    else:
+        device = torch.device("cpu")
+        print("[INFO] Using CPU for computation.")
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str,
                         default='data/girl1.jpg')
@@ -215,4 +294,6 @@ if __name__ == "__main__":
     parser.add_argument('--inversion_prompt', type=str, default='')
     parser.add_argument('--extract-reverse', default=False, action='store_true', help="extract features during the denoising process")
     opt = parser.parse_args()
+    opt.device = device
     run(opt)
+

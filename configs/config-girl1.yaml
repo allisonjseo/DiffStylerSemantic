@@ -1,6 +1,6 @@
 # general
 seed: 1
-device: 'cuda'
+device: 'mps'
 output_path: 'results/girl1'
 
 # data
