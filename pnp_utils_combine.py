@@ -9,27 +9,66 @@ def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
 
-def register_time(model_unet, t):
+def register_time(model_unet, t, source_latents=None):
+    if source_latents is not None:
+        model_unet.source_batch_size = source_latents.shape[0]
+    else:
+        model_unet.source_batch_size = 0
+
+    # Set 't' and 'source_batch_size' on the conv module
     conv_module = model_unet.up_blocks[1].resnets[1]
     setattr(conv_module, 't', t)
+    setattr(conv_module, 'source_batch_size', model_unet.source_batch_size)
+
+    # Set 't' and 'source_batch_size' on attention modules
     down_res_dict = {0: [0, 1], 1: [0, 1], 2: [0, 1]}
     up_res_dict = {1: [0, 1, 2], 2: [0, 1, 2], 3: [0, 1, 2]}
     for res in up_res_dict:
         for block in up_res_dict[res]:
-            module = model_unet.up_blocks[res].attentions[block].transformer_blocks[0].attn1
-            setattr(module, 't', t)
-            module = model_unet.up_blocks[res].attentions[block].transformer_blocks[0].attn2
-            setattr(module, 't', t)
+            module_attn1 = model_unet.up_blocks[res].attentions[block].transformer_blocks[0].attn1
+            module_attn2 = model_unet.up_blocks[res].attentions[block].transformer_blocks[0].attn2
+            for module in [module_attn1, module_attn2]:
+                setattr(module, 't', t)
+                setattr(module, 'source_batch_size', model_unet.source_batch_size)
     for res in down_res_dict:
         for block in down_res_dict[res]:
-            module = model_unet.down_blocks[res].attentions[block].transformer_blocks[0].attn1
-            setattr(module, 't', t)
-            module = model_unet.down_blocks[res].attentions[block].transformer_blocks[0].attn2
-            setattr(module, 't', t)
-    module = model_unet.mid_block.attentions[0].transformer_blocks[0].attn1
-    setattr(module, 't', t)
-    module = model_unet.mid_block.attentions[0].transformer_blocks[0].attn2
-    setattr(module, 't', t)
+            module_attn1 = model_unet.down_blocks[res].attentions[block].transformer_blocks[0].attn1
+            module_attn2 = model_unet.down_blocks[res].attentions[block].transformer_blocks[0].attn2
+            for module in [module_attn1, module_attn2]:
+                setattr(module, 't', t)
+                setattr(module, 'source_batch_size', model_unet.source_batch_size)
+    module_attn1 = model_unet.mid_block.attentions[0].transformer_blocks[0].attn1
+    module_attn2 = model_unet.mid_block.attentions[0].transformer_blocks[0].attn2
+    for module in [module_attn1, module_attn2]:
+        setattr(module, 't', t)
+        setattr(module, 'source_batch_size', model_unet.source_batch_size)
+
+    # model_unet.source_latents = source_latents
+    # if source_latents is not None:
+    #     model_unet.source_batch_size = source_latents.shape[0]
+    # else:
+    #     model_unet.source_batch_size = 0
+
+    # conv_module = model_unet.up_blocks[1].resnets[1]
+    # setattr(conv_module, 't', t)
+    # down_res_dict = {0: [0, 1], 1: [0, 1], 2: [0, 1]}
+    # up_res_dict = {1: [0, 1, 2], 2: [0, 1, 2], 3: [0, 1, 2]}
+    # for res in up_res_dict:
+    #     for block in up_res_dict[res]:
+    #         module = model_unet.up_blocks[res].attentions[block].transformer_blocks[0].attn1
+    #         setattr(module, 't', t)
+    #         module = model_unet.up_blocks[res].attentions[block].transformer_blocks[0].attn2
+    #         setattr(module, 't', t)
+    # for res in down_res_dict:
+    #     for block in down_res_dict[res]:
+    #         module = model_unet.down_blocks[res].attentions[block].transformer_blocks[0].attn1
+    #         setattr(module, 't', t)
+    #         module = model_unet.down_blocks[res].attentions[block].transformer_blocks[0].attn2
+    #         setattr(module, 't', t)
+    # module = model_unet.mid_block.attentions[0].transformer_blocks[0].attn1
+    # setattr(module, 't', t)
+    # module = model_unet.mid_block.attentions[0].transformer_blocks[0].attn2
+    # setattr(module, 't', t)
 
 def load_source_latents_t(t, latents_path):
     latents_t_path = os.path.join(latents_path, f'noisy_latents_{t}.pt')
@@ -108,8 +147,15 @@ def register_conv_control_efficient(model_unet, injection_schedule):
         def forward(input_tensor, temb):
             hidden_states = input_tensor
 
-            hidden_states = self.norm1(hidden_states)
-            hidden_states = self.nonlinearity(hidden_states)
+            # hidden_states = self.norm1(hidden_states)
+            # hidden_states = self.nonlinearity(hidden_states)
+            
+            if self.injection_schedule is not None and (self.t in self.injection_schedule or self.t == 1000):
+                source_batch_size = self.source_batch_size  # Use the correct source_batch_size
+                # inject unconditional
+                hidden_states[source_batch_size:2 * source_batch_size] = hidden_states[:source_batch_size]
+                # inject conditional
+                hidden_states[2 * source_batch_size:] = hidden_states[:source_batch_size]
 
             if self.upsample is not None:
                 # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984

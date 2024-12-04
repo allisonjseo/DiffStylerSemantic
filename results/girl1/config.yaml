@@ -2,6 +2,10 @@ device: mps
 guidance_scale: 10.5
 image_path: data/girl1.jpg
 latents_path: latents_forward
+lora_configs:
+- mask_path: mask/girl1_face.png
+  prompt: painting of <sss>, girl
+  weight_path: lora_models/lora_girl_c1.ckpt
 lora_name: lora_girl_c1
 mask: girl1_face
 n_timesteps: 50

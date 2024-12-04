@@ -1,6 +1,6 @@
-python lora_train.py --image_path data/deer_c1.jpg --prompt 'painting of <sss>, deer, grass'
+python lora_train.py --image_path data/deer_c1.jpg --prompt 'painting of <sss>, deer, grass' --style_image_path data/deer1.jpg
 
-python lora_train.py --image_path data/deer_c2.jpg --prompt 'painting of <sss>, deer'
+python lora_train.py --image_path data/deer_c2.jpg --prompt 'painting of <sss>, deer' --style_image_path data/deer1.jpg
 
 python preprocess.py --data_path data/deer1.jpg
 

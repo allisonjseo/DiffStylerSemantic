@@ -14,6 +14,7 @@ from transformers import logging
 from diffusers import DDIMScheduler, StableDiffusionPipeline
 
 from pnp_utils_combine import *
+from diffusers.loaders import LoraLoaderMixin
 
 # suppress partial model loading warning
 logging.set_verbosity_error()
@@ -59,9 +60,32 @@ class PNP(nn.Module):
         self.image, self.eps = self.get_data()
 
         self.text_embeds = self.get_text_embeds(config["prompt"], config["negative_prompt"])
-        self.pnp_guidance_embeds = self.get_text_embeds("", "").chunk(2)[0]
-
+        # self.pnp_guidance_embeds = self.get_text_embeds("", "").chunk(2)[0]
+        self.pnp_guidance_embeds = self.get_text_embeds("", "")[:1]  # Shape [1, ...]
+        
         self.unet_lora_list = []
+
+        self.load_lora_weights(config['lora_configs'])
+
+    def load_lora_weights(self, lora_configs):
+        self.lora_models = []
+        for config in lora_configs:
+            # Create a copy of the UNet model
+            unet_lora = copy.deepcopy(self.unet)
+            # Load the LoRA weights
+            lora_state_dict = torch.load(config['weight_path'], map_location=self.device)
+            # LoraLoaderMixin.load_lora_weights(unet_lora, lora_state_dict)
+            unet_lora.load_attn_procs(lora_state_dict)
+
+            # Load the mask
+            mask = Image.open(config['mask_path']).convert('L')
+            mask = mask.resize((64, 64), Image.BILINEAR)
+            mask = torch.tensor(np.array(mask) / 255.0, dtype=torch.float32).to(self.device)
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            # Get text embeddings for this style
+            text_embeds = self.get_text_embeds(config['prompt'], self.config["negative_prompt"])
+            # Store the model, mask, and text embeddings
+            self.lora_models.append({'unet': unet_lora, 'mask': mask, 'text_embeds': text_embeds})
 
     @torch.no_grad()
     def get_text_embeds(self, prompt, negative_prompt, batch_size=1):
@@ -77,8 +101,10 @@ class PNP(nn.Module):
         uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
 
         # Cat for final embeddings
-        text_embeddings = torch.cat([uncond_embeddings] * batch_size + [text_embeddings] * batch_size)
+        # text_embeddings = torch.cat([uncond_embeddings] * batch_size + [text_embeddings] * batch_size)
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings], dim=0)
         return text_embeddings
+        
 
     @torch.no_grad()
     def decode_latent(self, latents):
@@ -112,34 +138,93 @@ class PNP(nn.Module):
         noisy_latent = torch.load(latents_path).to(self.device)
         return image, noisy_latent
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    # def denoise_step(self, x, t):
+    #     # register the time step and features in pnp injection modules
+    #     source_latents = load_source_latents_t(t, os.path.join(self.config["latents_path"], os.path.splitext(os.path.basename(self.config["image_path"]))[0]))
+    #     #latent_model_input = torch.cat([source_latents] + ([x] * 2))
+
+    #     register_time(self.unet, t.item())
+    #     for unet_lora in self.lora_list:
+    #         register_time(unet_lora, t.item())
+        
+    #     # compute text embeddings
+    #     # text_embed_input = torch.cat([self.pnp_guidance_embeds, self.text_embeds], dim=0)
+    #     text_embeds = torch.cat([self.pnp_guidance_embeds, self.text_embeds], dim=0)  # Shape [3, ...]
+
+    #     # latent_model_input = torch.cat([x] * 2)
+    #     latent_model_input = torch.cat([source_latents, x, x])
+
+    #     # apply the denoising network
+    #     #print(self.unet)
+    #     # noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embed_input)['sample']
+    #     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=self.text_embeds)['sample']
+        
+
+    #     # for i in range(0,len(self.lora_text_embeds_list)):
+    #     #     text_embed_input = torch.cat([self.pnp_guidance_embeds, self.lora_text_embeds_list[i]], dim=0)
+    #     #     noise_pred_lora = self.lora_list[i](latent_model_input, t, encoder_hidden_states=text_embed_input)['sample']
+    #     #     noise_pred[:,:,self.mask_list[i]] = noise_pred_lora[:,:,self.mask_list[i]]
+
+    #     for lora_model in self.lora_models:
+    #         unet_lora = lora_model['unet']
+    #         mask = lora_model['mask']
+    #         text_embeds = lora_model['text_embeds']
+    #         # Compute noise prediction with the LoRA UNet
+    #         noise_pred_lora = unet_lora(latent_model_input, t, encoder_hidden_states=text_embeds)['sample']
+    #         # Blend the noise predictions based on the mask
+    #         noise_pred = noise_pred * (1 - mask) + noise_pred_lora * mask
+
+    #     # perform guidance
+    #     _, noise_pred_uncond, noise_pred_cond = noise_pred.chunk(3) #2
+    #     noise_pred = noise_pred_uncond + self.config["guidance_scale"] * (noise_pred_cond - noise_pred_uncond)
+
+    #     # compute the denoising step with the reference model
+    #     denoised_latent = self.scheduler.step(noise_pred, t, x)['prev_sample']
+    #     return denoised_latent
+
     def denoise_step(self, x, t):
-        # register the time step and features in pnp injection modules
-        source_latents = load_source_latents_t(t, os.path.join(self.config["latents_path"], os.path.splitext(os.path.basename(self.config["image_path"]))[0]))
-        latent_model_input = torch.cat([source_latents] + ([x] * 2))
+        # Load source latents (used in PnP modules)
+        source_latents = load_source_latents_t(
+            t,
+            os.path.join(
+                self.config["latents_path"],
+                os.path.splitext(os.path.basename(self.config["image_path"]))[0]
+            )
+        ).to(self.device)
 
-        register_time(self.unet, t.item())
-        for unet_lora in self.lora_list:
-            register_time(unet_lora, t.item())
+        # Ensure source_latents has correct batch size
+        if source_latents.dim() == 3:
+            source_latents = source_latents.unsqueeze(0)  # Add batch dimension
 
-        # compute text embeddings
-        text_embed_input = torch.cat([self.pnp_guidance_embeds, self.text_embeds], dim=0)
+        # Register time and source_latents in PnP modules
+        register_time(self.unet, t.item(), source_latents)
+        for lora_model in self.lora_models:
+            register_time(lora_model['unet'], t.item(), source_latents)
 
-        # apply the denoising network
-        #print(self.unet)
-        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embed_input)['sample']
+        # Prepare latent_model_input with batch size 3
+        latent_model_input = torch.cat([source_latents, x, x], dim=0)  # Shape: [3, C, H, W]
 
+        # Prepare text embeddings with batch size 3
+        text_embeds = torch.cat([self.pnp_guidance_embeds, self.text_embeds], dim=0)  # Shape: [3, ...]
 
-        for i in range(0,len(self.lora_text_embeds_list)):
-            text_embed_input = torch.cat([self.pnp_guidance_embeds, self.lora_text_embeds_list[i]], dim=0)
-            noise_pred_lora = self.lora_list[i](latent_model_input, t, encoder_hidden_states=text_embed_input)['sample']
-            noise_pred[:,:,self.mask_list[i]] = noise_pred_lora[:,:,self.mask_list[i]]
+        # Apply the denoising network
+        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeds)['sample']
 
-        # perform guidance
+        # Apply the LoRA models
+        for lora_model in self.lora_models:
+            unet_lora = lora_model['unet']
+            mask = lora_model['mask']
+            lora_text_embeds = torch.cat([self.pnp_guidance_embeds, lora_model['text_embeds']], dim=0)  # Shape: [3, ...]
+            noise_pred_lora = unet_lora(latent_model_input, t, encoder_hidden_states=lora_text_embeds)['sample']
+            # Blend the noise predictions based on the mask
+            noise_pred = noise_pred * (1 - mask) + noise_pred_lora * mask
+
+        # Perform guidance
         _, noise_pred_uncond, noise_pred_cond = noise_pred.chunk(3)
         noise_pred = noise_pred_uncond + self.config["guidance_scale"] * (noise_pred_cond - noise_pred_uncond)
 
-        # compute the denoising step with the reference model
+        # Compute the denoising step with the scheduler
         denoised_latent = self.scheduler.step(noise_pred, t, x)['prev_sample']
         return denoised_latent
 
