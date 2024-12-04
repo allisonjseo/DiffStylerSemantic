@@ -1,4 +1,4 @@
-# DiffStylerSemantic: Prioritizing Semantic Attributesin Image Style Transfer
+# DiffStylerSemantic: Prioritizing Semantic Attributes in Image Style Transfer
 </p>
 
 
